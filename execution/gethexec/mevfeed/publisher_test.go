@@ -78,6 +78,38 @@ func TestPublisherHelloAndBlockFrames(t *testing.T) {
 	}
 }
 
+func TestPublisherHelloUsesInitialCanonicalHead(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "feed.sock")
+	c := DefaultConfig
+	c.Enable, c.SocketPath, c.ChainID = true, path, 46630
+	p := NewPublisher(c)
+	head := testBlock(77, common.HexToHash("0x1234"))
+	if err := p.SetInitialHead(head.NumberU64(), head.Hash()); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer p.StopAndWait()
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	hello := readWireFrame(t, conn)
+	if hello.Kind != FrameHello || len(hello.Payload) != 89 {
+		t.Fatalf("unexpected HELLO: %+v", hello)
+	}
+	if got := binary.BigEndian.Uint64(hello.Payload[48:56]); got != head.NumberU64() {
+		t.Fatalf("HELLO head number = %d", got)
+	}
+	if got := common.BytesToHash(hello.Payload[56:88]); got != head.Hash() {
+		t.Fatalf("HELLO head hash = %s", got)
+	}
+}
+
 func TestPublisherQueueOverflowSetsGap(t *testing.T) {
 	c := DefaultConfig
 	c.Enable = true

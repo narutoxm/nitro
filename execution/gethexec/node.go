@@ -407,6 +407,12 @@ func CreateExecutionNode(
 	var mevFeedPublisher *mevfeed.Publisher
 	if mevFeedConfig.Enable {
 		mevFeedPublisher = mevfeed.NewPublisher(mevFeedConfig)
+		current := l2BlockChain.CurrentBlock()
+		if current != nil {
+			if err := mevFeedPublisher.SetInitialHead(current.Number.Uint64(), current.Hash()); err != nil {
+				return nil, fmt.Errorf("initialize MEV feed canonical head: %w", err)
+			}
+		}
 		execEngine.SetCanonicalBlockObserver(mevFeedPublisher)
 	}
 	if config.EnablePrefetchBlock {

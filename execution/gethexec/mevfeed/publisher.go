@@ -95,6 +95,21 @@ func NewPublisher(config Config) *Publisher {
 	return &Publisher{config: config, ingress: make(chan blockItem, config.QueueSize)}
 }
 
+// SetInitialHead seeds HELLO and reorg tracking from the chain's canonical
+// head before the publisher starts. Without this, a freshly connected client
+// receives a misleading zero head until the next block is observed.
+func (p *Publisher) SetInitialHead(number uint64, hash common.Hash) error {
+	if p.started.Load() || p.enabled.Load() {
+		return errors.New("cannot set MEV feed initial head after start")
+	}
+	p.stateMu.Lock()
+	defer p.stateMu.Unlock()
+	p.lastHeadNum, p.lastHeadHash = number, hash
+	p.lastObservedNum, p.lastObservedHash = number, hash
+	p.hasObserved = true
+	return nil
+}
+
 func (p *Publisher) Start(parent context.Context) error {
 	if !p.config.Enable {
 		return nil
