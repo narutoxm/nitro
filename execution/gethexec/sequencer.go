@@ -1265,7 +1265,6 @@ func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
 	defer nonceFailureCacheSizeGauge.Update(int64(s.nonceFailures.Len()))
 
 	config := s.config()
-	lastBlock := s.execEngine.bc.CurrentBlock()
 
 	// Clear out old nonceFailures
 	s.nonceFailures.Resize(config.NonceFailureCacheSize)
@@ -1367,6 +1366,8 @@ func (s *Sequencer) createBlock(ctx context.Context) (returnValue bool) {
 			queueItem.returnResult(txpool.ErrOversizedData)
 			continue
 		}
+		// Re-read for each tx: the head can advance while this loop runs.
+		lastBlock := s.execEngine.bc.CurrentBlock()
 		if queueItem.isTimeboosted &&
 			queueItem.blockStamp != 0 &&
 			lastBlock.Number.Uint64() >= queueItem.blockStamp+config.Timeboost.QueueTimeoutInBlocks {
