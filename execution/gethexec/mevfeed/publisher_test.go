@@ -110,6 +110,40 @@ func TestPublisherHelloUsesInitialCanonicalHead(t *testing.T) {
 	}
 }
 
+func TestPublisherHelloConsumesExistingStickyGap(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "feed.sock")
+	c := DefaultConfig
+	c.Enable, c.SocketPath, c.ChainID = true, path, 46630
+	p := NewPublisher(c)
+	p.stickyGap.Store(true)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := p.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	defer p.StopAndWait()
+	conn, err := net.Dial("unix", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	hello := readWireFrame(t, conn)
+	if hello.Kind != FrameHello || len(hello.Payload) != 89 || hello.Payload[88] != 1 {
+		t.Fatalf("HELLO did not report sticky gap: %+v", hello)
+	}
+	deadline := time.Now().Add(time.Second)
+	for !p.clientReady.Load() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if p.stickyGap.Load() {
+		t.Fatal("HELLO must consume the previously reported sticky gap")
+	}
+	p.TryPublish(testBlock(1, common.Hash{}), types.Receipts{})
+	if next := readWireFrame(t, conn); next.Kind != FrameBlockBegin {
+		t.Fatalf("unexpected stale GAP after HELLO: %+v", next)
+	}
+}
+
 func TestPublisherQueueOverflowSetsGap(t *testing.T) {
 	c := DefaultConfig
 	c.Enable = true

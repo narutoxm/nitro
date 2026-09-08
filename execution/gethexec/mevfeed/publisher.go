@@ -282,7 +282,15 @@ func (p *Publisher) writeHello() error {
 	p.stateMu.RLock()
 	num, hash := p.lastHeadNum, p.lastHeadHash
 	p.stateMu.RUnlock()
-	if !p.writeFrame(FrameHello, helloPayload(session, p.config.ChainID, num, hash, p.stickyGap.Load())) {
+	// HELLO is itself the recovery notification for any gap accumulated while
+	// no consumer was attached. Atomically consume only the gap that existed
+	// before this handshake; a concurrent queue drop sets stickyGap again and
+	// will still produce a later GAP frame.
+	gap := p.stickyGap.Swap(false)
+	if !p.writeFrame(FrameHello, helloPayload(session, p.config.ChainID, num, hash, gap)) {
+		if gap {
+			p.stickyGap.Store(true)
+		}
 		return errors.New("failed to write MEV feed HELLO")
 	}
 	return nil
