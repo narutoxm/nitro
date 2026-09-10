@@ -208,12 +208,18 @@ func (p *Publisher) acceptLoop(ctx context.Context) {
 		p.conn = c
 		p.connMu.Unlock()
 		clientConnectsCounter.Inc(1)
+		// HELLO, sticky-gap consumption, and the client-ready transition are
+		// one write transaction. Otherwise encodeLoop cannot observe ready
+		// between HELLO construction and its write.
+		p.writeMu.Lock()
 		p.clientReady.Store(false)
-		if err := p.writeHello(); err != nil {
+		err = p.writeHelloLocked()
+		if err != nil {
 			p.closeConn()
 		} else {
 			p.clientReady.Store(true)
 		}
+		p.writeMu.Unlock()
 	}
 }
 
@@ -277,6 +283,12 @@ func (p *Publisher) publishItem(item blockItem) {
 }
 
 func (p *Publisher) writeHello() error {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	return p.writeHelloLocked()
+}
+
+func (p *Publisher) writeHelloLocked() error {
 	var session [16]byte
 	_, _ = rand.Read(session[:])
 	p.stateMu.RLock()
@@ -287,7 +299,19 @@ func (p *Publisher) writeHello() error {
 	// before this handshake; a concurrent queue drop sets stickyGap again and
 	// will still produce a later GAP frame.
 	gap := p.stickyGap.Swap(false)
-	if !p.writeFrame(FrameHello, helloPayload(session, p.config.ChainID, num, hash, gap)) {
+	p.sequence++
+	encoded, err := encodeFrame(frame{
+		kind:     FrameHello,
+		sequence: p.sequence,
+		payload:  helloPayload(session, p.config.ChainID, num, hash, gap),
+	}, p.config.MaxFrameBytes)
+	if err != nil {
+		if gap {
+			p.stickyGap.Store(true)
+		}
+		return errors.New("failed to encode MEV feed HELLO")
+	}
+	if err := p.writeRawEncoded(encoded); err != nil {
 		if gap {
 			p.stickyGap.Store(true)
 		}
