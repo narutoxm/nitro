@@ -306,17 +306,24 @@ func (p *Publisher) writeHelloLocked() error {
 		payload:  helloPayload(session, p.config.ChainID, num, hash, gap),
 	}, p.config.MaxFrameBytes)
 	if err != nil {
+		encodeErrorsCounter.Inc(1)
 		if gap {
 			p.stickyGap.Store(true)
 		}
 		return errors.New("failed to encode MEV feed HELLO")
 	}
 	if err := p.writeRawEncoded(encoded); err != nil {
+		writeErrorsCounter.Inc(1)
+		if ne, ok := err.(net.Error); ok && ne.Timeout() {
+			writeTimeoutsCounter.Inc(1)
+		}
 		if gap {
 			p.stickyGap.Store(true)
 		}
 		return errors.New("failed to write MEV feed HELLO")
 	}
+	encodedFramesCounter.Inc(1)
+	encodedBytesCounter.Inc(int64(len(encoded)))
 	return nil
 }
 
