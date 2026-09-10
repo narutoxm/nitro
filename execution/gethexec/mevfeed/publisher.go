@@ -334,15 +334,20 @@ func (p *Publisher) writeFrame(kind FrameKind, payload []byte) bool {
 		p.stickyGap.Store(true)
 		return false
 	}
-	if p.stickyGap.Load() && kind != FrameGap && kind != FrameHello {
-		p.stateMu.RLock()
-		lastNum, headNum, lastHash, headHash := p.lastWrittenNum, p.lastHeadNum, p.lastWrittenHash, p.lastHeadHash
-		p.stateMu.RUnlock()
-		if err := p.writeRaw(FrameGap, gapPayload(lastNum, headNum, lastHash, headHash)); err != nil {
-			p.closeConn()
-			return false
+	if kind != FrameGap && kind != FrameHello {
+		// Claim the pending gap while holding writeMu. A queue drop happens
+		// outside this lock, so Load followed by Store(false) could erase a
+		// newer gap. Restore the claim only if writing the recovery frame fails.
+		if p.stickyGap.Swap(false) {
+			p.stateMu.RLock()
+			lastNum, headNum, lastHash, headHash := p.lastWrittenNum, p.lastHeadNum, p.lastWrittenHash, p.lastHeadHash
+			p.stateMu.RUnlock()
+			if err := p.writeRaw(FrameGap, gapPayload(lastNum, headNum, lastHash, headHash)); err != nil {
+				p.stickyGap.Store(true)
+				p.closeConn()
+				return false
+			}
 		}
-		p.stickyGap.Store(false)
 	}
 	p.sequence++
 	encoded, err := encodeFrame(frame{kind: kind, sequence: p.sequence, payload: payload}, p.config.MaxFrameBytes)

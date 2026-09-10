@@ -158,6 +158,30 @@ func TestPublisherQueueOverflowSetsGap(t *testing.T) {
 	}
 }
 
+func TestPublisherWriteFrameAtomicallyClaimsStickyGap(t *testing.T) {
+	p := NewPublisher(DefaultConfig)
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p.conn = server
+	p.clientReady.Store(true)
+	p.stickyGap.Store(true)
+	done := make(chan bool, 1)
+	go func() { done <- p.writeFrame(FrameBlockBegin, []byte{}) }()
+	if frame := readWireFrame(t, client); frame.Kind != FrameGap {
+		t.Fatalf("first frame must recover the claimed gap, got %v", frame.Kind)
+	}
+	if frame := readWireFrame(t, client); frame.Kind != FrameBlockBegin {
+		t.Fatalf("payload frame was not written after gap recovery, got %v", frame.Kind)
+	}
+	if !<-done {
+		t.Fatal("writeFrame failed")
+	}
+	if p.stickyGap.Load() {
+		t.Fatal("successful gap recovery must not leave a stale sticky gap")
+	}
+}
+
 func TestPublisherTracksReorgFromObservedHead(t *testing.T) {
 	c := DefaultConfig
 	c.Enable = true
