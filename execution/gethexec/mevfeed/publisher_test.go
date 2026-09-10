@@ -182,6 +182,76 @@ func TestPublisherWriteFrameAtomicallyClaimsStickyGap(t *testing.T) {
 	}
 }
 
+func TestPublisherGapRaisedDuringBlockWaitsForNextBoundary(t *testing.T) {
+	p := NewPublisher(DefaultConfig)
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p.conn = server
+	p.clientReady.Store(true)
+	p.enabled.Store(true)
+	for i := 0; i < cap(p.ingress); i++ {
+		p.ingress <- blockItem{block: testBlock(uint64(i), common.Hash{})}
+	}
+	tx := types.NewTransaction(
+		0,
+		common.HexToAddress("0x1234"),
+		big.NewInt(1),
+		21_000,
+		big.NewInt(1),
+		nil,
+	)
+	block := testBlock(1, common.Hash{}).WithBody(types.Body{Transactions: []*types.Transaction{tx}})
+	receipt := types.NewReceipt(nil, false, 21_000)
+	receipt.TxHash = tx.Hash()
+	receipt.EffectiveGasPrice = big.NewInt(1)
+	done := make(chan struct{})
+	go func() {
+		p.publishItem(blockItem{block: block, receipts: types.Receipts{receipt}})
+		close(done)
+	}()
+	if frame := readWireFrame(t, client); frame.Kind != FrameBlockBegin {
+		t.Fatalf("unexpected first block frame: %v", frame.Kind)
+	}
+	// A queue overflow may happen from the execution thread while the
+	// serialized block is still being written. The sticky flag must survive,
+	// but it must not be injected between BEGIN and the transaction/end frames.
+	dropped := make(chan struct{})
+	go func() {
+		p.TryPublish(testBlock(2, block.Hash()), types.Receipts{})
+		close(dropped)
+	}()
+	<-dropped
+	got := []Frame{readWireFrame(t, client), readWireFrame(t, client)}
+	<-done
+	if got[0].Kind != FrameTransaction || got[1].Kind != FrameBlockEnd {
+		t.Fatalf("GAP split an active block: got %v, %v", got[0].Kind, got[1].Kind)
+	}
+	if !p.stickyGap.Load() {
+		t.Fatal("concurrent queue drop was lost while block was being written")
+	}
+	// The next queued item consumes the GAP at a boundary, closes the old
+	// session, and drains stale items. No transaction or block-end frame may
+	// follow that GAP on this session.
+	nextDone := make(chan struct{})
+	go func() {
+		p.publishItem(blockItem{block: testBlock(3, block.Hash()), receipts: types.Receipts{}})
+		close(nextDone)
+	}()
+	if frame := readWireFrame(t, client); frame.Kind != FrameGap {
+		t.Fatalf("expected boundary GAP after queue drop, got %v", frame.Kind)
+	}
+	client.SetReadDeadline(time.Now().Add(time.Second))
+	var trailing [1]byte
+	if _, err := client.Read(trailing[:]); err == nil {
+		t.Fatal("old session continued after boundary GAP")
+	}
+	<-nextDone
+	if got := len(p.ingress); got != 0 {
+		t.Fatalf("stale ingress items survived GAP recovery: %d", got)
+	}
+}
+
 func TestPublisherTracksReorgFromObservedHead(t *testing.T) {
 	c := DefaultConfig
 	c.Enable = true

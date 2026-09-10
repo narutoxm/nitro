@@ -237,15 +237,31 @@ func (p *Publisher) encodeLoop(ctx context.Context) {
 }
 
 func (p *Publisher) publishItem(item blockItem) {
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
 	if item.reorg != nil {
-		if !p.writeFrame(FrameReorg, reorgPayload(item.reorg.oldNum, item.reorg.newNum, item.reorg.oldHash, item.reorg.newHash, item.reorg.parent)) {
+		// REORG is a block-boundary control frame. Leave any pending GAP for
+		// BLOCK_BEGIN so a dropped queue item can never split an active block.
+		if !p.writeFrameLocked(FrameReorg, reorgPayload(item.reorg.oldNum, item.reorg.newNum, item.reorg.oldHash, item.reorg.newHash, item.reorg.parent), false) {
 			return
 		}
+	}
+	// A queue drop invalidates everything still buffered behind the dropped
+	// item.  Report the GAP only at a block boundary, then force a fresh HELLO
+	// session so no pre-gap BLOCK_BEGIN/TRANSACTION can be mistaken for a
+	// contiguous stream by the consumer.
+	if claimed, ok := p.consumeGapLocked(); !ok {
+		return
+	} else if claimed {
+		p.closeConn()
+		p.drainIngress()
+		return
 	}
 	if len(item.block.Transactions()) != len(item.receipts) {
 		encodeErrorsCounter.Inc(1)
 		p.stickyGap.Store(true)
 		gapsCounter.Inc(1)
+		p.closeConn()
 		return
 	}
 	for _, receipt := range item.receipts {
@@ -253,10 +269,11 @@ func (p *Publisher) publishItem(item blockItem) {
 			encodeErrorsCounter.Inc(1)
 			p.stickyGap.Store(true)
 			gapsCounter.Inc(1)
+			p.closeConn()
 			return
 		}
 	}
-	if !p.writeFrame(FrameBlockBegin, blockBeginPayload(item.block, p.config.ChainID)) {
+	if !p.writeFrameLocked(FrameBlockBegin, blockBeginPayload(item.block, p.config.ChainID), false) {
 		return
 	}
 	var crc uint32
@@ -267,18 +284,25 @@ func (p *Publisher) publishItem(item blockItem) {
 			encodeErrorsCounter.Inc(1)
 			p.stickyGap.Store(true)
 			gapsCounter.Inc(1)
+			// BLOCK_BEGIN has already been sent. Do not leave the connection
+			// alive for a later GAP/transaction frame to split this block;
+			// force the consumer to start a fresh HELLO session.
+			p.closeConn()
 			return
 		}
 		crc = crc32.Update(crc, crcTable, payload)
-		if !p.writeFrame(FrameTransaction, payload) {
+		if !p.writeFrameLocked(FrameTransaction, payload, false) {
+			p.closeConn()
 			return
 		}
 		count++
 	}
-	if p.writeFrame(FrameBlockEnd, blockEndPayload(item.block, count, crc)) {
+	if p.writeFrameLocked(FrameBlockEnd, blockEndPayload(item.block, count, crc), false) {
 		p.stateMu.Lock()
 		p.lastWrittenNum, p.lastWrittenHash = item.block.NumberU64(), item.block.Hash()
 		p.stateMu.Unlock()
+	} else {
+		p.closeConn()
 	}
 }
 
@@ -330,23 +354,21 @@ func (p *Publisher) writeHelloLocked() error {
 func (p *Publisher) writeFrame(kind FrameKind, payload []byte) bool {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	return p.writeFrameLocked(kind, payload, true)
+}
+
+// writeFrameLocked writes one frame while the caller owns writeMu. GAP
+// recovery is optional because an entire block is serialized under one lock;
+// interior transaction/end frames must never insert a control frame into an
+// already-started block.
+func (p *Publisher) writeFrameLocked(kind FrameKind, payload []byte, consumeGap bool) bool {
 	if kind != FrameHello && !p.clientReady.Load() {
 		p.stickyGap.Store(true)
 		return false
 	}
-	if kind != FrameGap && kind != FrameHello {
-		// Claim the pending gap while holding writeMu. A queue drop happens
-		// outside this lock, so Load followed by Store(false) could erase a
-		// newer gap. Restore the claim only if writing the recovery frame fails.
-		if p.stickyGap.Swap(false) {
-			p.stateMu.RLock()
-			lastNum, headNum, lastHash, headHash := p.lastWrittenNum, p.lastHeadNum, p.lastWrittenHash, p.lastHeadHash
-			p.stateMu.RUnlock()
-			if err := p.writeRaw(FrameGap, gapPayload(lastNum, headNum, lastHash, headHash)); err != nil {
-				p.stickyGap.Store(true)
-				p.closeConn()
-				return false
-			}
+	if consumeGap && kind != FrameGap && kind != FrameHello {
+		if _, ok := p.consumeGapLocked(); !ok {
+			return false
 		}
 	}
 	p.sequence++
@@ -368,6 +390,35 @@ func (p *Publisher) writeFrame(kind FrameKind, payload []byte) bool {
 	encodedFramesCounter.Inc(1)
 	encodedBytesCounter.Inc(int64(len(encoded)))
 	return true
+}
+
+// consumeGapLocked atomically claims the pending gap and writes its control
+// frame while the caller owns writeMu. The bool reports whether a gap was
+// claimed; ok reports whether the frame was written successfully.
+func (p *Publisher) consumeGapLocked() (claimed, ok bool) {
+	if !p.stickyGap.Swap(false) {
+		return false, true
+	}
+	p.stateMu.RLock()
+	lastNum, headNum, lastHash, headHash := p.lastWrittenNum, p.lastHeadNum, p.lastWrittenHash, p.lastHeadHash
+	p.stateMu.RUnlock()
+	if err := p.writeRaw(FrameGap, gapPayload(lastNum, headNum, lastHash, headHash)); err != nil {
+		p.stickyGap.Store(true)
+		p.closeConn()
+		return true, false
+	}
+	return true, true
+}
+
+func (p *Publisher) drainIngress() {
+	for {
+		select {
+		case <-p.ingress:
+			queueDepthGauge.Update(int64(len(p.ingress)))
+		default:
+			return
+		}
+	}
 }
 
 func (p *Publisher) writeRaw(kind FrameKind, payload []byte) error {
