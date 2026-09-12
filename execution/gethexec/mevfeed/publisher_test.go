@@ -270,3 +270,30 @@ func TestPublisherTracksReorgFromObservedHead(t *testing.T) {
 		t.Fatalf("expected parent/height mismatch reorg, got %+v", item.reorg)
 	}
 }
+
+func TestPublisherEmitsStandaloneReorgBoundary(t *testing.T) {
+	p := NewPublisher(DefaultConfig)
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p.conn = server
+	p.clientReady.Store(true)
+	p.enabled.Store(true)
+	oldHead := testBlock(10, common.HexToHash("0x01"))
+	newHead := testBlock(8, common.HexToHash("0x02"))
+	p.TryPublishReorg(oldHead.NumberU64(), oldHead.Hash(), newHead)
+	item := <-p.ingress
+	if item.block != nil || item.reorg == nil {
+		t.Fatalf("expected standalone reorg item, got %+v", item)
+	}
+	done := make(chan struct{})
+	go func() {
+		p.publishItem(item)
+		close(done)
+	}()
+	frame := readWireFrame(t, client)
+	if frame.Kind != FrameReorg {
+		t.Fatalf("expected REORG frame, got %v", frame.Kind)
+	}
+	<-done
+}

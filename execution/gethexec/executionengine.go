@@ -528,6 +528,7 @@ func (s *ExecutionEngine) Reorg(msgIdxOfFirstMsgToAdd arbutil.MessageIndex, newM
 		log.Warn("reorg target block not found", "block", lastBlockNumToKeep)
 		return nil, nil
 	}
+	oldCanonicalHead := s.bc.CurrentBlock()
 
 	currentSafeBlock := s.bc.CurrentSafeBlock()
 	if currentSafeBlock != nil && lastBlockToKeep.Number().Cmp(currentSafeBlock.Number) < 0 {
@@ -547,6 +548,15 @@ func (s *ExecutionEngine) Reorg(msgIdxOfFirstMsgToAdd arbutil.MessageIndex, newM
 	err := s.bc.ReorgToOldBlock(lastBlockToKeep)
 	if err != nil {
 		return nil, err
+	}
+	// Notify the canonical MEV feed immediately, even when no replacement
+	// message/block is available yet. This closes the window in which consumers
+	// could continue trading against an orphaned cursor while execution is
+	// waiting for the next message.
+	if holder := s.canonicalBlockObserver.Load(); holder != nil {
+		if observer, ok := holder.observer.(mevfeed.ReorgObserver); ok {
+			observer.TryPublishReorg(oldCanonicalHead.Number.Uint64(), oldCanonicalHead.Hash(), lastBlockToKeep)
+		}
 	}
 
 	if s.reorgEventsNotifier != nil {

@@ -186,6 +186,33 @@ func (p *Publisher) TryPublish(block *types.Block, receipts types.Receipts) {
 	}
 }
 
+// TryPublishReorg emits a standalone REORG control item without waiting for a
+// replacement block. It is intentionally non-blocking like TryPublish so a
+// stalled MEV consumer can never pause execution.
+func (p *Publisher) TryPublishReorg(oldNumber uint64, oldHash common.Hash, newHead *types.Block) {
+	if !p.enabled.Load() || newHead == nil {
+		return
+	}
+	p.stateMu.Lock()
+	p.lastHeadNum, p.lastHeadHash = newHead.NumberU64(), newHead.Hash()
+	p.lastObservedNum, p.lastObservedHash = newHead.NumberU64(), newHead.Hash()
+	p.hasObserved = true
+	p.stateMu.Unlock()
+	item := blockItem{reorg: &reorgItem{
+		oldNum: oldNumber, oldHash: oldHash,
+		newNum: newHead.NumberU64(), newHash: newHead.Hash(), parent: newHead.ParentHash(),
+	}}
+	select {
+	case p.ingress <- item:
+		enqueuedCounter.Inc(1)
+		queueDepthGauge.Update(int64(len(p.ingress)))
+	default:
+		droppedCounter.Inc(1)
+		p.stickyGap.Store(true)
+		gapsCounter.Inc(1)
+	}
+}
+
 func (p *Publisher) acceptLoop(ctx context.Context) {
 	defer p.wg.Done()
 	for {
@@ -245,6 +272,11 @@ func (p *Publisher) publishItem(item blockItem) {
 		if !p.writeFrameLocked(FrameReorg, reorgPayload(item.reorg.oldNum, item.reorg.newNum, item.reorg.oldHash, item.reorg.newHash, item.reorg.parent), false) {
 			return
 		}
+	}
+	// A standalone reorg notification has no block payload. The next complete
+	// block (if any) will be published as a normal block-boundary item.
+	if item.block == nil {
+		return
 	}
 	// A queue drop invalidates everything still buffered behind the dropped
 	// item.  Report the GAP only at a block boundary, then force a fresh HELLO
