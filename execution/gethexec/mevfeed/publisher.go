@@ -271,14 +271,21 @@ func (p *Publisher) takePendingReorg() *reorgItem {
 // complete control frame. An active block may finish first, but no subsequent
 // old-generation block can pass the boundary.
 func (p *Publisher) publishPendingReorg() bool {
-	pending := p.takePendingReorg()
-	if pending == nil {
-		return false
-	}
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	p.writeFrameLocked(FrameReorg, reorgPayload(pending.oldNum, pending.newNum, pending.oldHash, pending.newHash, pending.parent), false)
-	return true
+	pending, _ := p.publishPendingReorgLocked()
+	return pending
+}
+
+// publishPendingReorgLocked flushes the latest canonical rollback while the
+// caller owns writeMu. Returning whether the frame was written lets a dequeued
+// block stop immediately when the barrier could not reach the current session.
+func (p *Publisher) publishPendingReorgLocked() (pending, written bool) {
+	item := p.takePendingReorg()
+	if item == nil {
+		return false, true
+	}
+	return true, p.writeFrameLocked(FrameReorg, reorgPayload(item.oldNum, item.newNum, item.oldHash, item.newHash, item.parent), false)
 }
 
 func (p *Publisher) acceptLoop(ctx context.Context) {
@@ -339,6 +346,12 @@ func (p *Publisher) encodeLoop(ctx context.Context) {
 func (p *Publisher) publishItem(item blockItem) {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
+	// Go select does not prioritize reorgNotify over ingress. Re-check the
+	// durable pending control state after dequeuing and flush it under the same
+	// write lock, so a current-generation block cannot cross the REORG barrier.
+	if pending, written := p.publishPendingReorgLocked(); pending && !written {
+		return
+	}
 	// A REORG increments generation before its control notification is queued.
 	// Re-check after acquiring writeMu so a block waiting behind an active write
 	// cannot leak from the old canonical branch after the REORG boundary.

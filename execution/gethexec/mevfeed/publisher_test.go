@@ -305,6 +305,42 @@ func TestPublisherEmitsStandaloneReorgBoundary(t *testing.T) {
 	<-done
 }
 
+func TestPublisherCurrentGenerationBlockWaitsForPendingReorg(t *testing.T) {
+	p := NewPublisher(DefaultConfig)
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p.conn = server
+	p.clientReady.Store(true)
+	p.enabled.Store(true)
+
+	oldHead := testBlock(10, common.HexToHash("0x01"))
+	newHead := testBlock(8, common.HexToHash("0x02"))
+	p.TryPublishReorg(oldHead.NumberU64(), oldHead.Hash(), newHead)
+	next := testBlock(newHead.NumberU64()+1, newHead.Hash())
+	item := blockItem{
+		block:      next,
+		receipts:   types.Receipts{},
+		generation: p.generation.Load(),
+	}
+
+	done := make(chan struct{})
+	go func() {
+		p.publishItem(item)
+		close(done)
+	}()
+	if frame := readWireFrame(t, client); frame.Kind != FrameReorg {
+		t.Fatalf("current-generation block crossed pending REORG barrier: %v", frame.Kind)
+	}
+	if frame := readWireFrame(t, client); frame.Kind != FrameBlockBegin {
+		t.Fatalf("expected BLOCK_BEGIN after REORG, got %v", frame.Kind)
+	}
+	if frame := readWireFrame(t, client); frame.Kind != FrameBlockEnd {
+		t.Fatalf("expected BLOCK_END after REORG, got %v", frame.Kind)
+	}
+	<-done
+}
+
 func TestPublisherStandaloneReorgDiscardsQueuedOldBlocks(t *testing.T) {
 	p := NewPublisher(DefaultConfig)
 	server, client := net.Pipe()
