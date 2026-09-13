@@ -150,8 +150,11 @@ func TestPublisherQueueOverflowSetsGap(t *testing.T) {
 	c.QueueSize = 16
 	p := NewPublisher(c)
 	p.enabled.Store(true)
+	parent := common.Hash{}
 	for i := uint64(1); i <= uint64(c.QueueSize)+1; i++ {
-		p.TryPublish(testBlock(i, common.Hash{}), types.Receipts{})
+		block := testBlock(i, parent)
+		p.TryPublish(block, types.Receipts{})
+		parent = block.Hash()
 	}
 	if !p.stickyGap.Load() {
 		t.Fatal("expected sticky gap after queue overflow")
@@ -261,13 +264,16 @@ func TestPublisherTracksReorgFromObservedHead(t *testing.T) {
 	second := testBlock(2, common.HexToHash("0x1234"))
 	p.TryPublish(first, types.Receipts{})
 	p.TryPublish(second, types.Receipts{})
-	item := <-p.ingress
-	if item.reorg != nil {
-		t.Fatal("first observed block must not be a reorg")
+	if got := len(p.ingress); got != 1 {
+		t.Fatalf("old-generation block was not discarded: %d queued", got)
 	}
-	item = <-p.ingress
-	if item.reorg == nil || item.reorg.oldNum != 0 || item.reorg.newNum != 2 {
-		t.Fatalf("expected parent/height mismatch reorg, got %+v", item.reorg)
+	item := <-p.ingress
+	if item.block != second || item.generation != p.generation.Load() {
+		t.Fatalf("replacement block has wrong generation: %+v", item)
+	}
+	reorg := p.takePendingReorg()
+	if reorg == nil || reorg.oldNum != 0 || reorg.newNum != 2 {
+		t.Fatalf("expected parent/height mismatch reorg, got %+v", reorg)
 	}
 }
 
@@ -282,13 +288,14 @@ func TestPublisherEmitsStandaloneReorgBoundary(t *testing.T) {
 	oldHead := testBlock(10, common.HexToHash("0x01"))
 	newHead := testBlock(8, common.HexToHash("0x02"))
 	p.TryPublishReorg(oldHead.NumberU64(), oldHead.Hash(), newHead)
-	item := <-p.ingress
-	if item.block != nil || item.reorg == nil {
-		t.Fatalf("expected standalone reorg item, got %+v", item)
+	if got := len(p.ingress); got != 0 {
+		t.Fatalf("standalone REORG entered block FIFO: %d", got)
 	}
 	done := make(chan struct{})
 	go func() {
-		p.publishItem(item)
+		if !p.publishPendingReorg() {
+			t.Error("standalone REORG was not pending")
+		}
 		close(done)
 	}()
 	frame := readWireFrame(t, client)
@@ -296,4 +303,67 @@ func TestPublisherEmitsStandaloneReorgBoundary(t *testing.T) {
 		t.Fatalf("expected REORG frame, got %v", frame.Kind)
 	}
 	<-done
+}
+
+func TestPublisherStandaloneReorgDiscardsQueuedOldBlocks(t *testing.T) {
+	p := NewPublisher(DefaultConfig)
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p.conn = server
+	p.clientReady.Store(true)
+	p.enabled.Store(true)
+	parent := common.Hash{}
+	for number := uint64(1); number <= 4; number++ {
+		block := testBlock(number, parent)
+		p.TryPublish(block, types.Receipts{})
+		parent = block.Hash()
+	}
+	if got := len(p.ingress); got != 4 {
+		t.Fatalf("test setup queued %d blocks", got)
+	}
+	oldHead := testBlock(4, common.Hash{})
+	newHead := testBlock(2, common.HexToHash("0xbeef"))
+	p.TryPublishReorg(oldHead.NumberU64(), oldHead.Hash(), newHead)
+	if got := len(p.ingress); got != 0 {
+		t.Fatalf("REORG left %d old-generation blocks queued", got)
+	}
+	done := make(chan bool, 1)
+	go func() { done <- p.publishPendingReorg() }()
+	if frame := readWireFrame(t, client); frame.Kind != FrameReorg {
+		t.Fatalf("old queued block preceded REORG boundary: %v", frame.Kind)
+	}
+	if !<-done {
+		t.Fatal("REORG control boundary was lost while discarding old blocks")
+	}
+}
+
+func TestPublisherStandaloneReorgSurvivesFullBlockQueue(t *testing.T) {
+	c := DefaultConfig
+	c.QueueSize = 16
+	p := NewPublisher(c)
+	server, client := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+	p.conn = server
+	p.clientReady.Store(true)
+	p.enabled.Store(true)
+	for number := uint64(1); number <= uint64(c.QueueSize); number++ {
+		p.ingress <- blockItem{block: testBlock(number, common.Hash{}), generation: p.generation.Load()}
+	}
+	oldHead := testBlock(uint64(c.QueueSize), common.Hash{})
+	newHead := testBlock(3, common.HexToHash("0xcafe"))
+	p.TryPublishReorg(oldHead.NumberU64(), oldHead.Hash(), newHead)
+	if got := len(p.ingress); got != 0 {
+		t.Fatalf("full old-generation queue was not discarded: %d", got)
+	}
+	done := make(chan bool, 1)
+	go func() { done <- p.publishPendingReorg() }()
+	frame := readWireFrame(t, client)
+	if frame.Kind != FrameReorg || common.BytesToHash(frame.Payload[48:80]) != newHead.Hash() {
+		t.Fatalf("full queue dropped REORG control boundary: %+v", frame)
+	}
+	if !<-done {
+		t.Fatal("full queue dropped REORG control boundary")
+	}
 }

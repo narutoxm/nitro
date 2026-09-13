@@ -32,13 +32,14 @@ var (
 	writeTimeoutsCounter     = metrics.NewRegisteredCounter("arb/mevfeed/write_timeouts", nil)
 	clientConnectsCounter    = metrics.NewRegisteredCounter("arb/mevfeed/client_connects", nil)
 	clientDisconnectsCounter = metrics.NewRegisteredCounter("arb/mevfeed/client_disconnects", nil)
+	reorgDiscardedCounter    = metrics.NewRegisteredCounter("arb/mevfeed/reorg_discarded_blocks", nil)
 	queueDepthGauge          = metrics.NewRegisteredGauge("arb/mevfeed/queue_depth", nil)
 )
 
 type blockItem struct {
-	block    *types.Block
-	receipts types.Receipts
-	reorg    *reorgItem
+	block      *types.Block
+	receipts   types.Receipts
+	generation uint64
 }
 type reorgItem struct {
 	oldNum, newNum           uint64
@@ -50,13 +51,16 @@ type reorgItem struct {
 type Publisher struct {
 	config           Config
 	ingress          chan blockItem
+	reorgNotify      chan struct{}
 	cancel           context.CancelFunc
 	wg               sync.WaitGroup
 	listener         net.Listener
 	connMu           sync.Mutex
 	writeMu          sync.Mutex
 	stateMu          sync.RWMutex
+	reorgMu          sync.Mutex
 	conn             net.Conn
+	pendingReorg     *reorgItem
 	sequence         uint64
 	lastObservedNum  uint64
 	lastObservedHash common.Hash
@@ -66,6 +70,7 @@ type Publisher struct {
 	lastHeadHash     common.Hash
 	hasObserved      bool
 	stickyGap        atomic.Bool
+	generation       atomic.Uint64
 	enabled          atomic.Bool
 	started          atomic.Bool
 	clientReady      atomic.Bool
@@ -92,7 +97,11 @@ func (p *Publisher) Stats() Stats {
 }
 
 func NewPublisher(config Config) *Publisher {
-	return &Publisher{config: config, ingress: make(chan blockItem, config.QueueSize)}
+	return &Publisher{
+		config:      config,
+		ingress:     make(chan blockItem, config.QueueSize),
+		reorgNotify: make(chan struct{}, 1),
+	}
 }
 
 // SetInitialHead seeds HELLO and reorg tracking from the chain's canonical
@@ -168,15 +177,16 @@ func (p *Publisher) TryPublish(block *types.Block, receipts types.Receipts) {
 	}
 	p.stateMu.Lock()
 	p.lastHeadNum, p.lastHeadHash = block.NumberU64(), block.Hash()
-	var reorg *reorgItem
+	generation := p.generation.Load()
 	if p.hasObserved && (block.NumberU64() != p.lastObservedNum+1 || block.ParentHash() != p.lastObservedHash) {
-		reorg = &reorgItem{oldNum: p.lastObservedNum, oldHash: p.lastObservedHash, newNum: block.NumberU64(), newHash: block.Hash(), parent: block.ParentHash()}
+		generation = p.queueReorg(&reorgItem{oldNum: p.lastObservedNum, oldHash: p.lastObservedHash, newNum: block.NumberU64(), newHash: block.Hash(), parent: block.ParentHash()})
+		p.discardQueuedBlocks()
 	}
 	p.lastObservedNum, p.lastObservedHash = block.NumberU64(), block.Hash()
 	p.hasObserved = true
 	p.stateMu.Unlock()
 	select {
-	case p.ingress <- blockItem{block: block, receipts: receipts, reorg: reorg}:
+	case p.ingress <- blockItem{block: block, receipts: receipts, generation: generation}:
 		enqueuedCounter.Inc(1)
 		queueDepthGauge.Update(int64(len(p.ingress)))
 	default:
@@ -197,20 +207,78 @@ func (p *Publisher) TryPublishReorg(oldNumber uint64, oldHash common.Hash, newHe
 	p.lastHeadNum, p.lastHeadHash = newHead.NumberU64(), newHead.Hash()
 	p.lastObservedNum, p.lastObservedHash = newHead.NumberU64(), newHead.Hash()
 	p.hasObserved = true
-	p.stateMu.Unlock()
-	item := blockItem{reorg: &reorgItem{
+	reorg := &reorgItem{
 		oldNum: oldNumber, oldHash: oldHash,
 		newNum: newHead.NumberU64(), newHash: newHead.Hash(), parent: newHead.ParentHash(),
-	}}
-	select {
-	case p.ingress <- item:
-		enqueuedCounter.Inc(1)
-		queueDepthGauge.Update(int64(len(p.ingress)))
-	default:
-		droppedCounter.Inc(1)
-		p.stickyGap.Store(true)
-		gapsCounter.Inc(1)
 	}
+	p.queueReorg(reorg)
+	p.discardQueuedBlocks()
+	p.stateMu.Unlock()
+}
+
+// queueReorg advances the canonical generation and publishes the latest
+// control boundary through a channel independent of the bounded block FIFO.
+// Multiple unconsumed rollbacks are coalesced from the oldest old head to the
+// newest canonical head, so the final recovery boundary is never lost.
+func (p *Publisher) queueReorg(next *reorgItem) uint64 {
+	generation := p.generation.Add(1)
+	p.reorgMu.Lock()
+	if pending := p.pendingReorg; pending != nil {
+		pending.newNum = next.newNum
+		pending.newHash = next.newHash
+		pending.parent = next.parent
+	} else {
+		copy := *next
+		p.pendingReorg = &copy
+	}
+	p.reorgMu.Unlock()
+	select {
+	case p.reorgNotify <- struct{}{}:
+	default:
+	}
+	return generation
+}
+
+// discardQueuedBlocks is called while stateMu is held, which prevents a new
+// canonical TryPublish from entering the FIFO until all pre-REORG items have
+// been removed. A producer that had already left stateMu can still enqueue an
+// old-generation item later; publishItem rejects it by generation.
+func (p *Publisher) discardQueuedBlocks() {
+	var discarded int64
+	for {
+		select {
+		case <-p.ingress:
+			discarded++
+		default:
+			if discarded > 0 {
+				reorgDiscardedCounter.Inc(discarded)
+				queueDepthGauge.Update(int64(len(p.ingress)))
+			}
+			return
+		}
+	}
+}
+
+func (p *Publisher) takePendingReorg() *reorgItem {
+	p.reorgMu.Lock()
+	defer p.reorgMu.Unlock()
+	pending := p.pendingReorg
+	p.pendingReorg = nil
+	return pending
+}
+
+// publishPendingReorg runs before every FIFO receive and owns writeMu for the
+// complete control frame. An active block may finish first, but no subsequent
+// old-generation block can pass the boundary.
+func (p *Publisher) publishPendingReorg() bool {
+	pending := p.takePendingReorg()
+	if pending == nil {
+		return false
+	}
+	p.writeMu.Lock()
+	defer p.writeMu.Unlock()
+	p.writeFrameLocked(FrameReorg, reorgPayload(pending.oldNum, pending.newNum, pending.oldHash, pending.newHash, pending.parent), false)
+	return true
 }
 
 func (p *Publisher) acceptLoop(ctx context.Context) {
@@ -253,9 +321,14 @@ func (p *Publisher) acceptLoop(ctx context.Context) {
 func (p *Publisher) encodeLoop(ctx context.Context) {
 	defer p.wg.Done()
 	for {
+		if p.publishPendingReorg() {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return
+		case <-p.reorgNotify:
+			continue
 		case item := <-p.ingress:
 			queueDepthGauge.Update(int64(len(p.ingress)))
 			p.publishItem(item)
@@ -266,16 +339,10 @@ func (p *Publisher) encodeLoop(ctx context.Context) {
 func (p *Publisher) publishItem(item blockItem) {
 	p.writeMu.Lock()
 	defer p.writeMu.Unlock()
-	if item.reorg != nil {
-		// REORG is a block-boundary control frame. Leave any pending GAP for
-		// BLOCK_BEGIN so a dropped queue item can never split an active block.
-		if !p.writeFrameLocked(FrameReorg, reorgPayload(item.reorg.oldNum, item.reorg.newNum, item.reorg.oldHash, item.reorg.newHash, item.reorg.parent), false) {
-			return
-		}
-	}
-	// A standalone reorg notification has no block payload. The next complete
-	// block (if any) will be published as a normal block-boundary item.
-	if item.block == nil {
+	// A REORG increments generation before its control notification is queued.
+	// Re-check after acquiring writeMu so a block waiting behind an active write
+	// cannot leak from the old canonical branch after the REORG boundary.
+	if item.block == nil || item.generation != p.generation.Load() {
 		return
 	}
 	// A queue drop invalidates everything still buffered behind the dropped
